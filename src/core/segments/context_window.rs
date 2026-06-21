@@ -1,9 +1,14 @@
 use super::{Segment, SegmentData};
 use crate::config::{InputData, ModelConfig, SegmentId, TranscriptEntry};
+use crate::utils::terminal::{format_token_count, token_label};
 use std::collections::HashMap;
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
+
+/// Default column threshold below which the unit label collapses from " tokens" to " tk".
+/// Can be overridden per-segment via `options.narrow_width`.
+const DEFAULT_NARROW_WIDTH: u16 = 80;
 
 #[derive(Default)]
 pub struct ContextWindowSegment;
@@ -13,7 +18,7 @@ impl ContextWindowSegment {
         Self
     }
 
-    /// Get context limit for the specified model
+    /// Get context limit for the specified model (fallback when native data absent).
     fn get_context_limit_for_model(model_id: &str) -> u32 {
         let model_config = ModelConfig::load();
         model_config.get_context_limit(model_id)
@@ -22,14 +27,59 @@ impl ContextWindowSegment {
 
 impl Segment for ContextWindowSegment {
     fn collect(&self, input: &InputData) -> Option<SegmentData> {
-        // Dynamically determine context limit based on current model ID
-        let context_limit = Self::get_context_limit_for_model(&input.model.id);
+        // Read the column-width threshold from segment options (configurable in TUI).
+        let narrow_width = crate::config::Config::load()
+            .ok()
+            .and_then(|c| {
+                c.segments
+                    .into_iter()
+                    .find(|s| s.id == SegmentId::ContextWindow)
+            })
+            .and_then(|sc| sc.options.get("narrow_width").and_then(|v| v.as_u64()))
+            .map(|v| v.clamp(1, u16::MAX as u64) as u16)
+            .unwrap_or(DEFAULT_NARROW_WIDTH);
 
+        // ── Source 1: Native context_window data (Claude Code ≥ v2.1.x) ──────────
+        // The `context_window` field is populated by modern Claude Code on every
+        // turn and is far more reliable than parsing the transcript.  We prefer it
+        // when present and fall back to transcript-parse for older versions.
+        if let Some(cw) = &input.context_window {
+            if cw.context_window_size > 0 {
+                let pct = cw.used_percentage;
+                let percentage = if pct.fract() == 0.0 {
+                    format!("{:.0}%", pct)
+                } else {
+                    format!("{:.1}%", pct)
+                };
+
+                // Use total_input_tokens (matches the official input-only formula).
+                let tokens_str = format_token_count(cw.total_input_tokens);
+                let label = token_label(narrow_width);
+                let primary = format!("{} · {}{}", percentage, tokens_str, label);
+
+                let mut metadata = HashMap::new();
+                metadata.insert("tokens".to_string(), cw.total_input_tokens.to_string());
+                metadata.insert("percentage".to_string(), pct.to_string());
+                metadata.insert("limit".to_string(), cw.context_window_size.to_string());
+                metadata.insert("model".to_string(), input.model.id.clone());
+                metadata.insert("source".to_string(), "native".to_string());
+
+                return Some(SegmentData {
+                    primary,
+                    secondary: String::new(),
+                    metadata,
+                });
+            }
+        }
+
+        // ── Source 2: Transcript-parse fallback (legacy / pre-v2.1.x) ────────────
+        let context_limit = Self::get_context_limit_for_model(&input.model.id);
         let context_used_token_opt = parse_transcript_usage(&input.transcript_path);
 
         let (percentage_display, tokens_display) = match context_used_token_opt {
             Some(context_used_token) => {
-                let context_used_rate = (context_used_token as f64 / context_limit as f64) * 100.0;
+                let context_used_rate =
+                    (context_used_token as f64 / context_limit as f64) * 100.0;
 
                 let percentage = if context_used_rate.fract() == 0.0 {
                     format!("{:.0}%", context_used_rate)
@@ -37,29 +87,17 @@ impl Segment for ContextWindowSegment {
                     format!("{:.1}%", context_used_rate)
                 };
 
-                let tokens = if context_used_token >= 1000 {
-                    let k_value = context_used_token as f64 / 1000.0;
-                    if k_value.fract() == 0.0 {
-                        format!("{}k", k_value as u32)
-                    } else {
-                        format!("{:.1}k", k_value)
-                    }
-                } else {
-                    context_used_token.to_string()
-                };
-
+                let tokens = format_token_count(context_used_token);
                 (percentage, tokens)
             }
-            None => {
-                // No usage data available
-                ("-".to_string(), "-".to_string())
-            }
+            None => ("-".to_string(), "-".to_string()),
         };
 
         let mut metadata = HashMap::new();
         match context_used_token_opt {
             Some(context_used_token) => {
-                let context_used_rate = (context_used_token as f64 / context_limit as f64) * 100.0;
+                let context_used_rate =
+                    (context_used_token as f64 / context_limit as f64) * 100.0;
                 metadata.insert("tokens".to_string(), context_used_token.to_string());
                 metadata.insert("percentage".to_string(), context_used_rate.to_string());
             }
@@ -70,9 +108,11 @@ impl Segment for ContextWindowSegment {
         }
         metadata.insert("limit".to_string(), context_limit.to_string());
         metadata.insert("model".to_string(), input.model.id.clone());
+        metadata.insert("source".to_string(), "transcript".to_string());
 
+        let label = token_label(narrow_width);
         Some(SegmentData {
-            primary: format!("{} · {} tokens", percentage_display, tokens_display),
+            primary: format!("{} · {}{}", percentage_display, tokens_display, label),
             secondary: String::new(),
             metadata,
         })

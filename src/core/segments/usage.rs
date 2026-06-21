@@ -5,6 +5,8 @@ use chrono::{DateTime, Datelike, Duration, Local, Timelike, Utc};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
+// ── HTTP-path types (used only when native rate_limits absent) ───────────────
+
 #[derive(Debug, Deserialize)]
 struct ApiUsageResponse {
     five_hour: UsagePeriod,
@@ -25,6 +27,8 @@ struct ApiUsageCache {
     cached_at: String,
 }
 
+// ── Segment impl ─────────────────────────────────────────────────────────────
+
 #[derive(Default)]
 pub struct UsageSegment;
 
@@ -33,6 +37,7 @@ impl UsageSegment {
         Self
     }
 
+    /// Pie-slice Nerd-Font icon representing 7-day utilisation (0.0–1.0 fraction).
     fn get_circle_icon(utilization: f64) -> String {
         let percent = (utilization * 100.0) as u8;
         match percent {
@@ -47,7 +52,8 @@ impl UsageSegment {
         }
     }
 
-    fn format_reset_time(reset_time_str: Option<&str>) -> String {
+    /// Format an RFC 3339 reset-time string as a compact `M-D-H` label.
+    fn format_reset_time_rfc3339(reset_time_str: Option<&str>) -> String {
         if let Some(time_str) = reset_time_str {
             if let Ok(dt) = DateTime::parse_from_rfc3339(time_str) {
                 let mut local_dt = dt.with_timezone(&Local);
@@ -65,6 +71,29 @@ impl UsageSegment {
         "?".to_string()
     }
 
+    /// Format a Unix-epoch-seconds reset time as a compact `M-D-H` label.
+    /// Used for the native `rate_limits.*.resets_at` field.
+    fn format_reset_time_epoch(epoch_secs: Option<u64>) -> String {
+        if let Some(secs) = epoch_secs {
+            use chrono::TimeZone;
+            if let Some(dt) = Utc.timestamp_opt(secs as i64, 0).single() {
+                let mut local_dt = dt.with_timezone(&Local);
+                if local_dt.minute() > 45 {
+                    local_dt += Duration::hours(1);
+                }
+                return format!(
+                    "{}-{}-{}",
+                    local_dt.month(),
+                    local_dt.day(),
+                    local_dt.hour()
+                );
+            }
+        }
+        "?".to_string()
+    }
+
+    // ── HTTP / cache helpers (legacy path) ───────────────────────────────────
+
     fn get_cache_path() -> Option<std::path::PathBuf> {
         let home = dirs::home_dir()?;
         Some(
@@ -79,7 +108,6 @@ impl UsageSegment {
         if !cache_path.exists() {
             return None;
         }
-
         let content = std::fs::read_to_string(&cache_path).ok()?;
         serde_json::from_str(&content).ok()
     }
@@ -107,11 +135,9 @@ impl UsageSegment {
 
     fn get_claude_code_version() -> String {
         use std::process::Command;
-
         let output = Command::new("npm")
             .args(["view", "@anthropic-ai/claude-code", "version"])
             .output();
-
         match output {
             Ok(output) if output.status.success() => {
                 let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -121,7 +147,6 @@ impl UsageSegment {
             }
             _ => {}
         }
-
         "claude-code".to_string()
     }
 
@@ -130,11 +155,8 @@ impl UsageSegment {
             .or_else(|_| std::env::var("USERPROFILE"))
             .ok()?;
         let settings_path = format!("{}/.claude/settings.json", home);
-
         let content = std::fs::read_to_string(&settings_path).ok()?;
         let settings: serde_json::Value = serde_json::from_str(&content).ok()?;
-
-        // Try HTTPS_PROXY first, then HTTP_PROXY
         settings
             .get("env")?
             .get("HTTPS_PROXY")
@@ -181,24 +203,96 @@ impl UsageSegment {
 }
 
 impl Segment for UsageSegment {
-    fn collect(&self, _input: &InputData) -> Option<SegmentData> {
+    fn collect(&self, input: &InputData) -> Option<SegmentData> {
+        // ── Source 1: Native rate_limits (Claude.ai Pro/Max subscribers) ─────────
+        //
+        // `rate_limits` is present in the stdin JSON only for subscriber accounts
+        // after the first API response. When present it is more reliable than the
+        // Keychain→HTTP path: no network call, no Keychain hex-decode bug, works
+        // on Windows and Linux without platform credential stores.
+        //
+        // Config option `usage_mode`:
+        //   "auto"         (default) — native when available, HTTP otherwise
+        //   "subscription" — always use native; return None if absent
+        //   "api"          — always use the HTTP path (API / Extra-Usage users)
+        let segment_config = crate::config::Config::load().ok().and_then(|c| {
+            c.segments
+                .into_iter()
+                .find(|s| s.id == SegmentId::Usage)
+        });
+
+        let usage_mode = segment_config
+            .as_ref()
+            .and_then(|sc| sc.options.get("usage_mode"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("auto")
+            .to_string();
+
+        // Try native path unless user forces "api" mode
+        if usage_mode != "api" {
+            if let Some(rl) = &input.rate_limits {
+                if let Some(five_h) = &rl.five_hour {
+                    let five_hour_pct = five_h.used_percentage;
+                    let seven_day_pct = rl
+                        .seven_day
+                        .as_ref()
+                        .map(|w| w.used_percentage)
+                        .unwrap_or(0.0);
+                    let resets_at_epoch = rl.seven_day.as_ref().and_then(|w| w.resets_at);
+
+                    let dynamic_icon = Self::get_circle_icon(seven_day_pct / 100.0);
+                    let five_hour_percent = five_hour_pct.round() as u8;
+                    let primary = format!("{}%", five_hour_percent);
+                    let secondary = format!(
+                        "· {}",
+                        Self::format_reset_time_epoch(resets_at_epoch)
+                    );
+
+                    let mut metadata = HashMap::new();
+                    metadata.insert("dynamic_icon".to_string(), dynamic_icon);
+                    metadata.insert(
+                        "five_hour_utilization".to_string(),
+                        five_hour_pct.to_string(),
+                    );
+                    metadata.insert(
+                        "seven_day_utilization".to_string(),
+                        seven_day_pct.to_string(),
+                    );
+                    metadata.insert("source".to_string(), "native".to_string());
+
+                    return Some(SegmentData {
+                        primary,
+                        secondary,
+                        metadata,
+                    });
+                }
+            }
+
+            // If the user explicitly chose "subscription" mode and native data is
+            // absent (API user or before the first response), surface nothing rather
+            // than falling through to the HTTP path.
+            if usage_mode == "subscription" {
+                return None;
+            }
+        }
+
+        // ── Source 2: HTTP / Keychain path (API users, Extra-Usage, legacy) ──────
         let token = credentials::get_oauth_token()?;
 
-        // Load config from file to get segment options
-        let config = crate::config::Config::load().ok()?;
-        let segment_config = config.segments.iter().find(|s| s.id == SegmentId::Usage);
-
         let api_base_url = segment_config
+            .as_ref()
             .and_then(|sc| sc.options.get("api_base_url"))
             .and_then(|v| v.as_str())
             .unwrap_or("https://api.anthropic.com");
 
         let cache_duration = segment_config
+            .as_ref()
             .and_then(|sc| sc.options.get("cache_duration"))
             .and_then(|v| v.as_u64())
             .unwrap_or(300);
 
         let timeout = segment_config
+            .as_ref()
             .and_then(|sc| sc.options.get("timeout"))
             .and_then(|v| v.as_u64())
             .unwrap_or(2);
@@ -249,7 +343,10 @@ impl Segment for UsageSegment {
         let dynamic_icon = Self::get_circle_icon(seven_day_util / 100.0);
         let five_hour_percent = five_hour_util.round() as u8;
         let primary = format!("{}%", five_hour_percent);
-        let secondary = format!("· {}", Self::format_reset_time(resets_at.as_deref()));
+        let secondary = format!(
+            "· {}",
+            Self::format_reset_time_rfc3339(resets_at.as_deref())
+        );
 
         let mut metadata = HashMap::new();
         metadata.insert("dynamic_icon".to_string(), dynamic_icon);
@@ -261,6 +358,7 @@ impl Segment for UsageSegment {
             "seven_day_utilization".to_string(),
             seven_day_util.to_string(),
         );
+        metadata.insert("source".to_string(), "http".to_string());
 
         Some(SegmentData {
             primary,

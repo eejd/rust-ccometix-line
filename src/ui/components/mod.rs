@@ -1,8 +1,8 @@
 pub mod color_picker;
-pub mod editor;
 pub mod help;
 pub mod icon_selector;
 pub mod name_input;
+pub mod options_editor;
 pub mod preview;
 pub mod segment_list;
 pub mod separator_editor;

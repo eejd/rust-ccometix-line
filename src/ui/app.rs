@@ -4,6 +4,7 @@ use crate::ui::components::{
     help::HelpComponent,
     icon_selector::IconSelectorComponent,
     name_input::NameInputComponent,
+    options_editor::OptionsEditorComponent,
     preview::PreviewComponent,
     segment_list::{FieldSelection, Panel, SegmentListComponent},
     separator_editor::SeparatorEditorComponent,
@@ -33,6 +34,7 @@ pub struct App {
     color_picker: ColorPickerComponent,
     icon_selector: IconSelectorComponent,
     name_input: NameInputComponent,
+    options_editor: OptionsEditorComponent,
     preview: PreviewComponent,
     segment_list: SegmentListComponent,
     separator_editor: SeparatorEditorComponent,
@@ -53,6 +55,7 @@ impl App {
             color_picker: ColorPickerComponent::new(),
             icon_selector: IconSelectorComponent::new(),
             name_input: NameInputComponent::new(),
+            options_editor: OptionsEditorComponent::new(),
             preview: PreviewComponent::new(),
             segment_list: SegmentListComponent::new(),
             separator_editor: SeparatorEditorComponent::new(),
@@ -183,6 +186,54 @@ impl App {
                         }
                         _ => {}
                     }
+                } else if app.options_editor.is_open {
+                    if app.options_editor.editing_value || app.options_editor.entering_key {
+                        // Inner input mode: only intercept editing keys
+                        match key.code {
+                            KeyCode::Enter => {
+                                if app.options_editor.entering_key {
+                                    app.options_editor.finish_new_key();
+                                } else {
+                                    app.options_editor.finish_edit_value();
+                                }
+                            }
+                            KeyCode::Esc => {
+                                app.options_editor.editing_value = false;
+                                app.options_editor.entering_key = false;
+                                app.options_editor.input_buffer.clear();
+                            }
+                            KeyCode::Char(c) => app.options_editor.input_char(c),
+                            KeyCode::Backspace => app.options_editor.backspace(),
+                            _ => {}
+                        }
+                    } else {
+                        // Navigation / command mode
+                        match key.code {
+                            KeyCode::Esc => app.options_editor.close(),
+                            KeyCode::Up => app.options_editor.move_selection(-1),
+                            KeyCode::Down => app.options_editor.move_selection(1),
+                            KeyCode::Enter => app.options_editor.start_edit_value(),
+                            KeyCode::Char('n') | KeyCode::Char('N') => {
+                                app.options_editor.start_new_key()
+                            }
+                            KeyCode::Delete | KeyCode::Char('d') => {
+                                app.options_editor.delete_selected()
+                            }
+                            KeyCode::Char('s') | KeyCode::Char('S') => {
+                                // Save options back to the segment config
+                                let new_options = app.options_editor.get_options();
+                                if let Some(segment) =
+                                    app.config.segments.get_mut(app.selected_segment)
+                                {
+                                    segment.options = new_options;
+                                    app.preview.update_preview(&app.config);
+                                }
+                                app.options_editor.close();
+                                app.status_message = Some("Options saved!".to_string());
+                            }
+                            _ => {}
+                        }
+                    }
                 } else {
                     // Handle main app events
                     match key.code {
@@ -229,6 +280,7 @@ impl App {
                         KeyCode::Char('p') => app.cycle_theme(),
                         KeyCode::Char('r') => app.reset_to_theme_defaults(),
                         KeyCode::Char('e') | KeyCode::Char('E') => app.open_separator_editor(),
+                        KeyCode::Char('m') | KeyCode::Char('M') => app.cycle_style_mode(),
                         _ => {}
                     }
                 }
@@ -310,6 +362,7 @@ impl App {
                 "[P] Switch Theme",
                 "[R] Reset",
                 "[E] Edit Separator",
+                "[M] Style Mode",
                 "[S] Save Config",
                 "[W] Write Theme",
                 "[Ctrl+S] Save Theme",
@@ -453,6 +506,9 @@ impl App {
         if self.separator_editor.is_open {
             self.separator_editor.render(f, f.area());
         }
+        if self.options_editor.is_open {
+            self.options_editor.render(f, f.area());
+        }
     }
 
     fn move_selection(&mut self, delta: i32) {
@@ -563,9 +619,7 @@ impl App {
                         }
                     }
                     FieldSelection::Options => {
-                        // TODO: Implement options editor
-                        self.status_message =
-                            Some("Options editor not implemented yet".to_string());
+                        self.open_options_editor();
                     }
                 }
             }
@@ -705,5 +759,33 @@ impl App {
     fn open_separator_editor(&mut self) {
         self.status_message = Some("Opening separator editor...".to_string());
         self.separator_editor.open(&self.config.style.separator);
+    }
+
+    /// Open the per-segment options editor for the currently selected segment.
+    fn open_options_editor(&mut self) {
+        if let Some(segment) = self.config.segments.get(self.selected_segment) {
+            self.options_editor.open(&segment.options);
+            self.status_message = Some("Editing segment options...".to_string());
+        }
+    }
+
+    /// Cycle `config.style.mode` through Plain → NerdFont → Powerline → Plain.
+    ///
+    /// This was previously not editable in the TUI at all; users had to hand-
+    /// edit `config.toml`.  The new keybinding `M` cycles the mode and updates
+    /// the preview immediately.
+    fn cycle_style_mode(&mut self) {
+        self.config.style.mode = match self.config.style.mode {
+            StyleMode::Plain => StyleMode::NerdFont,
+            StyleMode::NerdFont => StyleMode::Powerline,
+            StyleMode::Powerline => StyleMode::Plain,
+        };
+        let mode_name = match self.config.style.mode {
+            StyleMode::Plain => "Plain",
+            StyleMode::NerdFont => "Nerd Font",
+            StyleMode::Powerline => "Powerline",
+        };
+        self.status_message = Some(format!("Style mode: {}", mode_name));
+        self.preview.update_preview(&self.config);
     }
 }

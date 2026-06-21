@@ -91,9 +91,29 @@ pub struct Model {
     pub display_name: String,
 }
 
+/// Git repository identity parsed from the `origin` remote.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Repo {
+    pub host: Option<String>,
+    pub owner: Option<String>,
+    pub name: Option<String>,
+}
+
 #[derive(Deserialize)]
 pub struct Workspace {
     pub current_dir: String,
+    /// Directory where Claude Code was launched (may differ from `current_dir`).
+    #[serde(default)]
+    pub project_dir: Option<String>,
+    /// Name of the linked git worktree when inside `git worktree add` path.
+    #[serde(default)]
+    pub git_worktree: Option<String>,
+    /// Repository identity parsed from the `origin` remote.
+    #[serde(default)]
+    pub repo: Option<Repo>,
+    /// Extra directories added via `/add-dir` or `--add-dir`.
+    #[serde(default)]
+    pub added_dirs: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -110,6 +130,71 @@ pub struct OutputStyle {
     pub name: String,
 }
 
+/// Per-component token counts from the most recent API response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct CurrentUsage {
+    #[serde(default)]
+    pub input_tokens: u32,
+    #[serde(default)]
+    pub output_tokens: u32,
+    #[serde(default)]
+    pub cache_creation_input_tokens: u32,
+    #[serde(default)]
+    pub cache_read_input_tokens: u32,
+}
+
+/// Native context-window data provided by Claude Code (≥ v2.1.x).
+/// Supersedes the transcript-parse fallback for modern versions.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ContextWindowData {
+    /// Combined input tokens (input + cache_creation + cache_read) currently in context.
+    #[serde(default)]
+    pub total_input_tokens: u32,
+    /// Output tokens from the most recent response.
+    #[serde(default)]
+    pub total_output_tokens: u32,
+    /// Maximum context window size for the current model, in tokens.
+    #[serde(default)]
+    pub context_window_size: u32,
+    /// Percentage of context used (input-only formula, 0–100).
+    #[serde(default)]
+    pub used_percentage: f64,
+    /// Remaining context percentage (100 − used_percentage).
+    #[serde(default)]
+    pub remaining_percentage: f64,
+    /// Breakdown by cache category. `null` before the first API call or after `/compact`.
+    pub current_usage: Option<CurrentUsage>,
+}
+
+/// A single rate-limit window (5-hour or 7-day).
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimitWindow {
+    /// Utilisation percentage (0.0–100.0).
+    pub used_percentage: f64,
+    /// Unix epoch seconds when this window resets. Absent when unavailable.
+    pub resets_at: Option<u64>,
+}
+
+/// Native rate-limit data from Claude Code.
+/// Only present for Claude.ai Pro/Max subscribers after the first API response.
+#[derive(Debug, Clone, Deserialize)]
+pub struct RateLimits {
+    pub five_hour: Option<RateLimitWindow>,
+    pub seven_day: Option<RateLimitWindow>,
+}
+
+/// Reasoning effort level chosen for the session.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Effort {
+    pub level: String,
+}
+
+/// Whether extended thinking is enabled for the session.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Thinking {
+    pub enabled: bool,
+}
+
 #[derive(Deserialize)]
 pub struct InputData {
     pub model: Model,
@@ -117,6 +202,42 @@ pub struct InputData {
     pub transcript_path: String,
     pub cost: Option<Cost>,
     pub output_style: Option<OutputStyle>,
+
+    // --- Native fields added in Claude Code ≥ v2.1.x ---
+    // All are `Option` / have `#[serde(default)]` so deserialization stays
+    // backward-compatible with older Claude Code versions.
+
+    /// Pre-computed context-window statistics. Supersedes transcript-parse when present.
+    #[serde(default)]
+    pub context_window: Option<ContextWindowData>,
+
+    /// Rate-limit utilisation (Pro/Max only). Supersedes the Keychain→HTTP path when present.
+    #[serde(default)]
+    pub rate_limits: Option<RateLimits>,
+
+    /// True when the context exceeds the 200 k-token legacy limit (relevant for 1M models).
+    #[serde(default)]
+    pub exceeds_200k_tokens: bool,
+
+    /// Extended-thinking configuration.
+    #[serde(default)]
+    pub effort: Option<Effort>,
+
+    /// Whether extended thinking is active.
+    #[serde(default)]
+    pub thinking: Option<Thinking>,
+
+    /// Claude Code version string (e.g. "2.1.90").
+    #[serde(default)]
+    pub version: Option<String>,
+
+    /// Unique session identifier.
+    #[serde(default)]
+    pub session_id: Option<String>,
+
+    /// Current working directory (same as `workspace.current_dir`; prefer that field).
+    #[serde(default)]
+    pub cwd: Option<String>,
 }
 
 // OpenAI-style nested token details
